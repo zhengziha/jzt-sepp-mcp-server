@@ -88,6 +88,7 @@ class DefectMonitor:
         fuzzy_responser: str = "",
         dev_responser_id: str = "",
         test_responser_id: str = "",
+        responsers: list[str] | None = None,
         status: str = "",
         interval_minutes: int = 30,
         new_defect_alert: bool = True,
@@ -95,8 +96,11 @@ class DefectMonitor:
         timeout_hours: float | None = None,
         alert_on_baseline: bool = False,
     ) -> dict:
-        if not (fuzzy_responser or dev_responser_id or test_responser_id):
-            raise ValueError("至少指定一个负责人过滤条件：fuzzy_responser / dev_responser_id / test_responser_id")
+        """新增监控。responsers 为多用户名称列表（如 ["郑益2", "房航"]），
+        与 fuzzy_responser（单用户）二选一；都填时以 responsers 为准。"""
+        responser_names = [str(n).strip() for n in (responsers or []) if str(n).strip()]
+        if not (fuzzy_responser or dev_responser_id or test_responser_id or responser_names):
+            raise ValueError("至少指定一个负责人过滤条件：responsers / fuzzy_responser / dev_responser_id / test_responser_id")
         with self._lock:
             if name in self._state["monitors"]:
                 raise ValueError(f"监控 '{name}' 已存在，请换名称或先删除")
@@ -104,6 +108,7 @@ class DefectMonitor:
                 "fuzzy_responser": str(fuzzy_responser or ""),
                 "dev_responser_id": str(dev_responser_id or ""),
                 "test_responser_id": str(test_responser_id or ""),
+                "responser_names": responser_names,
                 "status": status or self.config.default_status,
                 "interval_minutes": max(1, int(interval_minutes)),
                 "new_defect_alert": bool(new_defect_alert),
@@ -219,15 +224,30 @@ class DefectMonitor:
 
         client = client or self._make_client()
         params = {
-            "fuzzyResponser": snapshot["fuzzy_responser"],
             "devResponserId": snapshot["dev_responser_id"],
             "testResponserId": snapshot["test_responser_id"],
             "status": snapshot["status"],
             "pageNum": 1,
             "pageSize": 100,
         }
+        query_params = dict(params)
+        if snapshot["fuzzy_responser"]:
+            query_params["fuzzyResponser"] = snapshot["fuzzy_responser"]
+        responser_names = snapshot.get("responser_names") or []
+        missing_users: list[str] = []
         try:
-            result = client.query_defects(params)
+            if responser_names:
+                # 多用户：名称列表 -> userId 列表，逐个查询后合并去重
+                resolved = client.resolve_user_ids(responser_names)
+                missing_users = resolved["missing"]
+                if missing_users:
+                    logger.warning("监控 %s 用户名称解析不到 userId: %s", name, missing_users)
+                result = (
+                    client.query_defects_multi(resolved["user_ids"], query_params)
+                    if resolved["user_ids"] else {"total": 0, "list": []}
+                )
+            else:
+                result = client.query_defects(query_params)
         except Exception as exc:  # noqa: BLE001
             logger.error("监控 %s 查询失败: %s", name, exc)
             return {"monitor": name, "error": str(exc)}
@@ -240,6 +260,9 @@ class DefectMonitor:
         new_items: list[dict] = []
         timeout_items: list[dict] = []
         messages: list[str] = []
+        # 钉钉 @：按负责人姓名查 dingtalk_at_map 映射，命中则 @ 手机号（触发提醒），未命中则名称加粗
+        at_mobiles: list[str] = []
+        at_map = self.config.alert.dingtalk_at_map
 
         with self._lock:
             baseline = not snapshot["baselined"]
@@ -258,6 +281,7 @@ class DefectMonitor:
                     "summary": summary[:120],
                     "priority": d.get("priority"),
                     "foundTime": str(d.get("foundTime") or ""),
+                    "responserName": str(d.get("responserName") or ""),
                 }
                 rec = seen.get(did)
                 is_new = rec is None
@@ -272,8 +296,19 @@ class DefectMonitor:
                     seen[did] = rec
                     if not baseline and snapshot["new_defect_alert"]:
                         new_items.append(item)
+                        rname = item["responserName"]
+                        if rname:
+                            mob = at_map.get(rname)
+                            if mob:
+                                at_mobiles.append(mob)
+                                rname_txt = f" <@{mob}>"
+                            else:
+                                rname_txt = f" **@{rname}**"
+                        else:
+                            rname_txt = ""
                         messages.append(
-                            f"[新增缺陷] ID={did} 状态={status} 优先级={item['priority']} 标题: {summary}"
+                            f"- **新增缺陷** `#{did}` 状态={status} 优先级={item['priority']}{rname_txt}\n"
+                            f"  {summary}"
                         )
                 else:
                     rec["last"] = item
@@ -297,9 +332,20 @@ class DefectMonitor:
                         if elapsed >= threshold_hours and not rec.get("timeout_alerted"):
                             rec["timeout_alerted"] = True
                             timeout_items.append({**item, "elapsed_hours": round(elapsed, 1)})
+                            rname = item["responserName"]
+                            if rname:
+                                mob = at_map.get(rname)
+                                if mob:
+                                    at_mobiles.append(mob)
+                                    rname_txt = f" <@{mob}>"
+                                else:
+                                    rname_txt = f" **@{rname}**"
+                            else:
+                                rname_txt = ""
                             messages.append(
-                                f"[超时提醒] 缺陷 ID={did} 已处理 {elapsed:.1f} 小时"
-                                f"（阈值 {threshold_hours} 小时）: {summary}"
+                                f"- **超时提醒** `#{did}` 已处理 {elapsed:.1f} 小时"
+                                f"（阈值 {threshold_hours} 小时）{rname_txt}\n"
+                                f"  {summary}"
                             )
 
             # 清理：已关闭且超过 24h 未再出现的记录
@@ -321,6 +367,8 @@ class DefectMonitor:
         summary = {
             "monitor": name,
             "baseline": baseline,
+            "users": responser_names or [snapshot["fuzzy_responser"] or ""],
+            "missing_users": missing_users,
             "total": result.get("total", 0) if isinstance(result, dict) else len(defects),
             "fetched": len(defects),
             "new_defects": len(new_items),
@@ -328,8 +376,10 @@ class DefectMonitor:
             "messages": messages,
         }
         if messages:
-            text = "\n".join([f"【SEPP 缺陷提醒】监控: {name}（{now:%Y-%m-%d %H:%M:%S}）"] + messages)
-            summary["alert_delivered"] = send_alert(text, self.config.alert)
+            text = "\n\n".join(
+                [f"### 【SEPP 缺陷提醒】监控：{name}\n> {now:%Y-%m-%d %H:%M:%S}"] + messages
+            )
+            summary["alert_delivered"] = send_alert(text, self.config.alert, at_mobiles)
         return summary
 
     # ---------------- 守护模式 ----------------

@@ -49,13 +49,14 @@ def _refresh_session() -> dict[str, str]:
 
 @mcp.tool()
 def login_status() -> dict:
-    """查看当前登录状态（是否已登录、账号、sepp-auth 过期时间）及默认用户信息"""
+    """查看当前登录状态（是否已登录、账号、sepp-auth 过期时间）、默认用户及监控用户配置"""
     info = _session.status()
     info["default_user"] = {
         "userId": _config.user_id,
         "userName": _config.user_name,
         "userAccount": _config.user_account,
     }
+    info["monitor_users"] = _config.monitor_users
     return info
 
 
@@ -92,30 +93,47 @@ def query_defects(
     fuzzy_responser: str = "",
     dev_responser_id: str = "",
     test_responser_id: str = "",
+    responsers: list[str] | None = None,
     status: str = "",
     priority: str = "",
     summary: str = "",
     page_num: int = 1,
     page_size: int = 20,
 ) -> dict:
-    """查询缺陷列表（支持按负责人过滤）。
+    """查询缺陷列表（支持按负责人过滤，可一次查多个用户）。
 
     参数：
-    - fuzzy_responser: 负责人模糊匹配，可填 userId/姓名/账号，例如 "1001967" 或 "郑自航"
+    - responsers: 负责人名称列表，一次查多个用户（自动解析名称 -> userId 分别查询后合并去重），
+      例如 ["郑益2", "房航"]；也可填 userId/账号
+    - fuzzy_responser: 单个负责人，可填 userId/姓名/账号，例如 "1001967" 或 "郑自航"
     - dev_responser_id: 开发负责人 userId（用 get_users 查询）
     - test_responser_id: 测试负责人 userId
     - status: 缺陷状态，逗号分隔多个，默认 "1,2,3,4,5,6"（全部）
     - priority: 优先级过滤
     - summary: 标题关键字过滤
-    - page_num / page_size: 分页
+    - page_num / page_size: 分页（多用户时表示每个用户最多取 page_size 条，合并后去重）
 
-    **默认行为**：三个负责人参数都不填时，默认查"我"（默认用户 郑自航/1001967）的缺陷，
-    与 query_my_defects 等价；要查别人请显式传 fuzzy_responser（姓名/账号/userId）。
+    **默认行为**：responsers 和三个负责人参数都不填时，默认查"我"（默认用户 郑自航/1001967）。
+    多用户查询返回额外字段 matched（名称->userId）和 missing（解析不到的名称）。
 
     返回平台的原始 JSON（含 total / list）。"""
+    client = _get_client()
+    if responsers:
+        resolved = client.resolve_user_ids(responsers)
+        extra = {"matched": resolved["matched"], "missing": resolved["missing"]}
+        if not resolved["user_ids"]:
+            return {"total": 0, "list": [], **extra}
+        result = client.query_defects_multi(resolved["user_ids"], {
+            "status": status or _config.default_status,
+            "priority": priority,
+            "summary": summary,
+            "pageNum": page_num,
+            "pageSize": min(int(page_size), 200),
+        })
+        return {**result, **extra}
     if not (fuzzy_responser or dev_responser_id or test_responser_id):
         fuzzy_responser = _config.user_id
-    return _get_client().query_defects({
+    return client.query_defects({
         "fuzzyResponser": fuzzy_responser,
         "devResponserId": dev_responser_id,
         "testResponserId": test_responser_id,
@@ -148,28 +166,35 @@ def monitor_add(
     fuzzy_responser: str = "",
     dev_responser_id: str = "",
     test_responser_id: str = "",
+    responsers: list[str] | None = None,
     status: str = "1,2,3,4,5,6",
     interval_minutes: int = 30,
     new_defect_alert: bool = True,
     timeout_alert: bool = True,
     timeout_hours: float = 2.0,
 ) -> dict:
-    """新增一个缺陷监控任务（自动定时轮询 + 提醒）。
+    """新增一个缺陷监控任务（自动定时轮询 + 提醒，可一次监控多个用户）。
 
-    - 负责人不填时默认监控"我"（默认用户 郑自航/1001967）；也可指定：
-      fuzzy_responser（userId/姓名/账号，查别人），或 dev_responser_id / test_responser_id（用 get_users 查 userId）
+    - responsers: 负责人名称列表，一次监控多个用户（自动解析名称 -> userId 分别查询后合并），
+      例如 ["郑益2", "房航"]；不填时：若配置了 SEPP_MONITOR_USERS 则用配置的用户列表，
+      否则监控"我"（默认用户 郑自航/1001967）
+    - fuzzy_responser: 单个负责人（userId/姓名/账号）；dev_responser_id / test_responser_id：用 get_users 查 userId
     - new_defect_alert: 是否提醒新增缺陷
     - timeout_alert / timeout_hours: 是否提醒处理超时，超过 N 小时未处理（默认 2 小时）
     - 首次执行为基线检查（只记录不提醒），之后开始提醒。
     - 提醒通过 webhook（钉钉/企微/飞书）或邮件发送，未配置时仅打印日志。
     建议先 monitor_run_once 建立基线。"""
-    if not (fuzzy_responser or dev_responser_id or test_responser_id):
-        fuzzy_responser = _config.user_id
+    if not (fuzzy_responser or dev_responser_id or test_responser_id or responsers):
+        if _config.monitor_users:
+            responsers = list(_config.monitor_users)
+        else:
+            fuzzy_responser = _config.user_id
     return _monitor.add_monitor(
         name=name,
         fuzzy_responser=fuzzy_responser,
         dev_responser_id=dev_responser_id,
         test_responser_id=test_responser_id,
+        responsers=responsers,
         status=status,
         interval_minutes=interval_minutes,
         new_defect_alert=new_defect_alert,

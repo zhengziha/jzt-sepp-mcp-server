@@ -45,6 +45,9 @@ def build_sso_url(redirect_uri: str = REDIRECT_URI) -> str:
 class AlertConfig:
     webhook_url: str = ""
     webhook_type: str = "dingtalk"  # dingtalk | wecom | feishu | generic
+    # 钉钉 @ 手机号映射：负责人姓名 -> 钉钉手机号（平台用户接口无手机号，需静态配置）。
+    # 告警时按缺陷的 responserName 查映射：命中则 @ 手机号（触发钉钉提醒），未命中则负责人名称加粗。
+    dingtalk_at_map: dict[str, str] = field(default_factory=dict)
     smtp_host: str = ""
     smtp_port: int = 465
     smtp_user: str = ""
@@ -65,6 +68,9 @@ class Config:
     user_account: str = DEFAULT_USER_ACCOUNT
     product_id: str = DEFAULT_PRODUCT_ID
     headless: bool = True
+    # 定时监控默认监控的用户名称列表（如 ["郑益2", "房航"]）。
+    # monitor_add 不指定负责人时，优先用它（一次监控多个用户）；为空则监控"我"。
+    monitor_users: list[str] = field(default_factory=list)
     # SSO（Keycloak）登录提交的是明文密码，会被计入错误次数（连续 5 次锁定账号）。
     # 默认禁用，仅当显式设置 SEPP_ALLOW_SSO_LOGIN=true 时启用浏览器兜底登录。
     allow_sso_login: bool = False
@@ -95,6 +101,8 @@ def load_config() -> Config:
     cfg.user_name = os.getenv("SEPP_USER_NAME", cfg.user_name)
     cfg.user_account = os.getenv("SEPP_USER_ACCOUNT", cfg.user_account)
     cfg.product_id = os.getenv("SEPP_PRODUCT_ID", cfg.product_id)
+    if os.getenv("SEPP_MONITOR_USERS"):
+        cfg.monitor_users = [s.strip() for s in os.environ["SEPP_MONITOR_USERS"].split(",") if s.strip()]
     cfg.headless = os.getenv("SEPP_HEADLESS", "true").lower() not in ("false", "0", "no")
     cfg.allow_sso_login = os.getenv("SEPP_ALLOW_SSO_LOGIN", "false").lower() in ("true", "1", "yes", "on")
     if os.getenv("SEPP_LOGIN_TIMEOUT"):
@@ -115,6 +123,8 @@ def load_config() -> Config:
     a = cfg.alert
     a.webhook_url = os.getenv("SEPP_WEBHOOK_URL", a.webhook_url)
     a.webhook_type = os.getenv("SEPP_WEBHOOK_TYPE", a.webhook_type)
+    if os.getenv("SEPP_DINGTALK_AT_MAP"):
+        a.dingtalk_at_map = _parse_kv_map(os.environ["SEPP_DINGTALK_AT_MAP"])
     a.smtp_host = os.getenv("SEPP_SMTP_HOST", a.smtp_host)
     if os.getenv("SEPP_SMTP_PORT"):
         a.smtp_port = int(os.environ["SEPP_SMTP_PORT"])
@@ -131,6 +141,7 @@ def _apply_yaml(cfg: Config, raw: dict[str, Any]) -> None:
         "base_url", "sso_url", "username", "password", "auth_token",
         "user_id", "user_name", "user_account", "product_id", "headless", "allow_sso_login",
         "default_status", "active_statuses", "timeout_hours", "login_timeout_seconds",
+        "monitor_users",
     ):
         if key in raw:
             setattr(cfg, key, raw[key])
@@ -138,6 +149,20 @@ def _apply_yaml(cfg: Config, raw: dict[str, Any]) -> None:
     for key in (
         "webhook_url", "webhook_type", "smtp_host", "smtp_port",
         "smtp_user", "smtp_password", "smtp_use_ssl", "email_to",
+        "dingtalk_at_map",
     ):
         if key in alert:
             setattr(cfg.alert, key, alert[key])
+
+
+def _parse_kv_map(raw: str) -> dict[str, str]:
+    """解析 "姓名:手机号,姓名2:手机号2" 为 dict"""
+    result: dict[str, str] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        k, _, v = item.partition(":")
+        if k.strip() and v.strip():
+            result[k.strip()] = v.strip()
+    return result
