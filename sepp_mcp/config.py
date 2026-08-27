@@ -65,6 +65,9 @@ class Config:
     user_account: str = DEFAULT_USER_ACCOUNT
     product_id: str = DEFAULT_PRODUCT_ID
     headless: bool = True
+    # SSO（Keycloak）登录提交的是明文密码，会被计入错误次数（连续 5 次锁定账号）。
+    # 默认禁用，仅当显式设置 SEPP_ALLOW_SSO_LOGIN=true 时启用浏览器兜底登录。
+    allow_sso_login: bool = False
     login_timeout_seconds: int = 90
     cookie_file: Path = ROOT / "data" / "cookies.json"
     profile_dir: Path = ROOT / "data" / "browser_profile"
@@ -93,6 +96,7 @@ def load_config() -> Config:
     cfg.user_account = os.getenv("SEPP_USER_ACCOUNT", cfg.user_account)
     cfg.product_id = os.getenv("SEPP_PRODUCT_ID", cfg.product_id)
     cfg.headless = os.getenv("SEPP_HEADLESS", "true").lower() not in ("false", "0", "no")
+    cfg.allow_sso_login = os.getenv("SEPP_ALLOW_SSO_LOGIN", "false").lower() in ("true", "1", "yes", "on")
     if os.getenv("SEPP_LOGIN_TIMEOUT"):
         cfg.login_timeout_seconds = int(os.environ["SEPP_LOGIN_TIMEOUT"])
     if os.getenv("SEPP_COOKIE_FILE"):
@@ -125,8 +129,8 @@ def load_config() -> Config:
 def _apply_yaml(cfg: Config, raw: dict[str, Any]) -> None:
     for key in (
         "base_url", "sso_url", "username", "password", "auth_token",
-        "user_id", "user_name", "user_account", "product_id", "headless", "default_status",
-        "active_statuses", "timeout_hours", "login_timeout_seconds",
+        "user_id", "user_name", "user_account", "product_id", "headless", "allow_sso_login",
+        "default_status", "active_statuses", "timeout_hours", "login_timeout_seconds",
     ):
         if key in raw:
             setattr(cfg, key, raw[key])
