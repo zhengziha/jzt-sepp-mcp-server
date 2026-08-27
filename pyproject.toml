@@ -1,0 +1,23 @@
+[project]
+name = "jzt-sepp-mcp-server"
+version = "0.1.0"
+description = "能效平台 (SEPP) 缺陷管理 MCP Server：自动登录 + 缺陷查询 + 定时提醒"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=2.0.0",
+    "httpx>=0.27.0",
+    "playwright>=1.45.0",
+    "APScheduler>=3.10.0",
+    "PyYAML>=6.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+sepp-mcp = "sepp_mcp.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["sepp_mcp*"]
