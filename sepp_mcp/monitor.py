@@ -1,6 +1,7 @@
 """缺陷监控：定时轮询 -> 新增缺陷提醒 + 处理超时（默认 >2 小时）提醒"""
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import threading
@@ -8,6 +9,11 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl  # POSIX：多实例跨进程锁
+except ImportError:  # Windows 无 fcntl，退化为单进程行为
+    fcntl = None
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -62,6 +68,47 @@ class DefectMonitor:
         self._lock = threading.Lock()
         self._state = self._load_state()
         self._scheduler: BackgroundScheduler | None = None
+        self._schedule_lock_fd: Any = None
+        self._owns_schedule = self._try_take_schedule_lock()
+
+    def _try_take_schedule_lock(self) -> bool:
+        """跨进程调度权（非阻塞抢锁）。
+
+        多个 MCP 实例 / daemon 同时运行时会各自启动定时器；这里保证同一份
+        monitor_state.json 只有一个实例真正调度轮询，其余实例仅提供服务
+        （手动 monitor_run_once 仍可用）。进程退出后锁自动释放。
+        """
+        if fcntl is None:
+            return True  # 非 POSIX 平台退化为原行为
+        try:
+            fd = open(self.state_file.with_suffix(".sched.lock"), "w")
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            logger.info("检测到其他实例已持有调度权，本实例只提供服务，不启动定时调度")
+            return False
+        self._schedule_lock_fd = fd
+        logger.info("本实例获得调度权，负责定时轮询监控")
+        return True
+
+    @contextlib.contextmanager
+    def _check_lock(self):
+        """跨进程互斥：检查/写状态期间持有文件锁（阻塞获取）。
+
+        多实例同时触发 run_check 或增删改监控时，串行执行并基于最新 state
+        去重，避免重复提醒、避免并发写坏 monitor_state.json。
+        """
+        if fcntl is None:
+            yield
+            return
+        fd = open(self.state_file.with_suffix(".check.lock"), "w")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                fd.close()
 
     # ---------------- 状态持久化 ----------------
     def _load_state(self) -> dict:
@@ -101,49 +148,54 @@ class DefectMonitor:
         responser_names = [str(n).strip() for n in (responsers or []) if str(n).strip()]
         if not (fuzzy_responser or dev_responser_id or test_responser_id or responser_names):
             raise ValueError("至少指定一个负责人过滤条件：responsers / fuzzy_responser / dev_responser_id / test_responser_id")
-        with self._lock:
-            if name in self._state["monitors"]:
-                raise ValueError(f"监控 '{name}' 已存在，请换名称或先删除")
-            mon: dict[str, Any] = {
-                "fuzzy_responser": str(fuzzy_responser or ""),
-                "dev_responser_id": str(dev_responser_id or ""),
-                "test_responser_id": str(test_responser_id or ""),
-                "responser_names": responser_names,
-                "status": status or self.config.default_status,
-                "interval_minutes": max(1, int(interval_minutes)),
-                "new_defect_alert": bool(new_defect_alert),
-                "timeout_alert": bool(timeout_alert),
-                "timeout_hours": float(timeout_hours if timeout_hours is not None else self.config.timeout_hours),
-                "alert_on_baseline": bool(alert_on_baseline),
-                "baselined": False,
-                "enabled": True,
-                "seen": {},
-            }
-            self._state["monitors"][name] = mon
-            self._save_state()
-        self._schedule(name)
+        with self._check_lock():
+            with self._lock:
+                if name in self._state["monitors"]:
+                    raise ValueError(f"监控 '{name}' 已存在，请换名称或先删除")
+                mon: dict[str, Any] = {
+                    "fuzzy_responser": str(fuzzy_responser or ""),
+                    "dev_responser_id": str(dev_responser_id or ""),
+                    "test_responser_id": str(test_responser_id or ""),
+                    "responser_names": responser_names,
+                    "status": status or self.config.default_status,
+                    "interval_minutes": max(1, int(interval_minutes)),
+                    "new_defect_alert": bool(new_defect_alert),
+                    "timeout_alert": bool(timeout_alert),
+                    "timeout_hours": float(timeout_hours if timeout_hours is not None else self.config.timeout_hours),
+                    "alert_on_baseline": bool(alert_on_baseline),
+                    "baselined": False,
+                    "enabled": True,
+                    "seen": {},
+                }
+                self._state["monitors"][name] = mon
+                self._save_state()
+        if self._owns_schedule:
+            self._schedule(name)
         logger.info("新增监控: %s", name)
         return self._summary_monitor(name)
 
     def remove_monitor(self, name: str) -> dict:
-        with self._lock:
-            if name not in self._state["monitors"]:
-                raise ValueError(f"监控 '{name}' 不存在")
-            del self._state["monitors"][name]
-            self._save_state()
+        with self._check_lock():
+            with self._lock:
+                if name not in self._state["monitors"]:
+                    raise ValueError(f"监控 '{name}' 不存在")
+                del self._state["monitors"][name]
+                self._save_state()
         if self._scheduler:
             self._scheduler.remove_job(self._job_id(name))
         return {"removed": name}
 
     def set_enabled(self, name: str, enabled: bool) -> dict:
-        with self._lock:
-            mon = self._state["monitors"].get(name)
-            if not mon:
-                raise ValueError(f"监控 '{name}' 不存在")
-            mon["enabled"] = bool(enabled)
-            self._save_state()
+        with self._check_lock():
+            with self._lock:
+                mon = self._state["monitors"].get(name)
+                if not mon:
+                    raise ValueError(f"监控 '{name}' 不存在")
+                mon["enabled"] = bool(enabled)
+                self._save_state()
         if enabled:
-            self._schedule(name)
+            if self._owns_schedule:
+                self._schedule(name)
         elif self._scheduler:
             self._scheduler.remove_job(self._job_id(name))
         return self._summary_monitor(name)
@@ -189,7 +241,14 @@ class DefectMonitor:
         logger.info("已调度监控 %s（每 %s 分钟）", name, mon["interval_minutes"])
 
     def restore_schedules(self) -> None:
-        """服务启动时恢复所有启用的监控"""
+        """服务启动时恢复所有启用的监控。
+
+        仅"调度权"实例真正调度：多个 MCP 实例 / daemon 同时存在时，只有抢到
+        sched.lock 的那个负责定时轮询，其余实例只提供服务，避免重复定时任务。
+        """
+        if not self._owns_schedule:
+            logger.info("非调度权实例，跳过监控调度恢复（已有其他实例在跑定时任务）")
+            return
         with self._lock:
             names = [n for n, m in self._state["monitors"].items() if m.get("enabled", True)]
         for name in names:
@@ -212,7 +271,14 @@ class DefectMonitor:
         """执行一次检查：查询缺陷 -> 比对 seen -> 新增/超时告警 -> 更新状态
 
         首次执行为“基线”检查：仅记录当前缺陷，不发告警（避免历史缺陷刷屏）。
+
+        跨进程互斥：多个 MCP 实例 / daemon 同时触发时，通过 check.lock 串行执行；
+        后执行的实例读到最新 seen，不会重复提醒、不会写坏 monitor_state.json。
         """
+        with self._check_lock():
+            return self._do_run_check(name, client)
+
+    def _do_run_check(self, name: str, client: Any = None) -> dict:
         with self._lock:
             mon = self._state["monitors"].get(name)
             if mon is None:
@@ -388,7 +454,10 @@ class DefectMonitor:
         jobs = self._scheduler.get_jobs() if self._scheduler else []
         logger.info("daemon 已启动，共 %s 个监控任务", len(jobs))
         if not jobs:
-            logger.warning("没有启用的监控任务，daemon 空转。")
+            if self._owns_schedule:
+                logger.warning("没有启用的监控任务，daemon 空转。请先 monitor-add 建监控。")
+            else:
+                logger.warning("本实例未获得调度权（已有其他 MCP 实例/daemon 在跑），daemon 空转。")
         try:
             while True:
                 time.sleep(30)
