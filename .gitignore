@@ -6,3 +6,4 @@ __pycache__/
 data/
 config.yaml
 .DS_Store
+.mcp.json

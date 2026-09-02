@@ -204,6 +204,29 @@ def monitor_add(
 
 
 @mcp.tool()
+def monitor_update(
+    name: str,
+    interval_minutes: int | None = None,
+    schedule_start: str | None = None,
+    schedule_end: str | None = None,
+    clear_schedule: bool = False,
+) -> dict:
+    """更新监控配置：轮询间隔（分钟）、每天轮询时间窗口（HH:MM，如 09:00 / 20:30）。
+
+    传 None 的字段保持不变；clear_schedule=True 清除时间窗口（恢复全天轮询）。
+    更新后立即按新配置重新调度（无需重启服务）。
+    """
+    if clear_schedule:
+        schedule_start = schedule_end = ""
+    return _monitor.update_monitor(
+        name=name,
+        interval_minutes=interval_minutes,
+        schedule_start=schedule_start,
+        schedule_end=schedule_end,
+    )
+
+
+@mcp.tool()
 def monitor_run_once(name: str) -> dict:
     """立即执行一次指定监控的检查（不等定时周期），返回本次结果（新增/超时数等）"""
     return _monitor.run_check(name, _get_client())

@@ -16,6 +16,7 @@ except ImportError:  # Windows 无 fcntl，退化为单进程行为
     fcntl = None
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from .alerts import send_alert
@@ -142,6 +143,8 @@ class DefectMonitor:
         timeout_alert: bool = True,
         timeout_hours: float | None = None,
         alert_on_baseline: bool = False,
+        schedule_start: str | None = None,
+        schedule_end: str | None = None,
     ) -> dict:
         """新增监控。responsers 为多用户名称列表（如 ["郑益2", "房航"]），
         与 fuzzy_responser（单用户）二选一；都填时以 responsers 为准。"""
@@ -163,6 +166,8 @@ class DefectMonitor:
                     "timeout_alert": bool(timeout_alert),
                     "timeout_hours": float(timeout_hours if timeout_hours is not None else self.config.timeout_hours),
                     "alert_on_baseline": bool(alert_on_baseline),
+                    "schedule_start": str(schedule_start or "").strip(),
+                    "schedule_end": str(schedule_end or "").strip(),
                     "baselined": False,
                     "enabled": True,
                     "seen": {},
@@ -172,6 +177,35 @@ class DefectMonitor:
         if self._owns_schedule:
             self._schedule(name)
         logger.info("新增监控: %s", name)
+        return self._summary_monitor(name)
+
+    def update_monitor(
+        self,
+        name: str,
+        interval_minutes: int | None = None,
+        schedule_start: str | None = None,
+        schedule_end: str | None = None,
+    ) -> dict:
+        """更新监控配置（轮询间隔 / 每天时间窗口）。
+
+        传 None 的字段保持不变；schedule_start/schedule_end 传空串表示清除窗口（恢复全天）。
+        若本实例持有调度权，立即按新配置重新调度。
+        """
+        with self._check_lock():
+            with self._lock:
+                mon = self._state["monitors"].get(name)
+                if not mon:
+                    raise ValueError(f"监控 '{name}' 不存在")
+                if interval_minutes is not None:
+                    mon["interval_minutes"] = max(1, int(interval_minutes))
+                if schedule_start is not None:
+                    mon["schedule_start"] = str(schedule_start).strip()
+                if schedule_end is not None:
+                    mon["schedule_end"] = str(schedule_end).strip()
+                self._save_state()
+        if mon.get("enabled", True) and self._owns_schedule:
+            self._schedule(name)  # replace_existing=True，立即按新配置重调度
+        logger.info("更新监控: %s", name)
         return self._summary_monitor(name)
 
     def remove_monitor(self, name: str) -> dict:
@@ -228,17 +262,57 @@ class DefectMonitor:
             mon = self._state["monitors"].get(name)
             if not mon or not mon.get("enabled", True):
                 return
+            interval = max(1, int(mon["interval_minutes"]))
+            start = str(mon.get("schedule_start") or "").strip()
+            end = str(mon.get("schedule_end") or "").strip()
         scheduler = self._ensure_scheduler()
+        if interval >= 60 or not (start and end):
+            # 间隔 >=1 小时或未配置窗口：IntervalTrigger 驱动，窗口由 _scheduled_check 兜底过滤
+            trigger = IntervalTrigger(minutes=interval)
+        else:
+            trigger = CronTrigger(minute=f"*/{interval}")
         scheduler.add_job(
-            self.run_check,
-            IntervalTrigger(minutes=int(mon["interval_minutes"])),
+            self._scheduled_check,
+            trigger,
             args=[name],
             id=self._job_id(name),
             replace_existing=True,
             coalesce=True,
             max_instances=1,
         )
-        logger.info("已调度监控 %s（每 %s 分钟）", name, mon["interval_minutes"])
+        if start and end:
+            logger.info("已调度监控 %s（窗口 %s-%s，每 %s 分钟）", name, start, end, interval)
+        else:
+            logger.info("已调度监控 %s（全天，每 %s 分钟）", name, interval)
+
+    @staticmethod
+    def _in_window(mon: dict) -> bool:
+        """当前时间是否在监控时间窗口内（schedule_start ~ schedule_end，HH:MM）。未配置窗口返回 True；支持跨天窗口。"""
+        start = str(mon.get("schedule_start") or "").strip()
+        end = str(mon.get("schedule_end") or "").strip()
+        if not start or not end:
+            return True
+        try:
+            s = datetime.strptime(start, "%H:%M").time()
+            e = datetime.strptime(end, "%H:%M").time()
+        except ValueError:
+            return True
+        now_t = datetime.now().time()
+        if s <= e:
+            return s <= now_t <= e
+        return now_t >= s or now_t <= e  # 跨天窗口（如 22:00-06:00）
+
+    def _scheduled_check(self, name: str) -> dict:
+        """定时任务入口：窗口外直接跳过（不查库），窗口内才执行真正检查。手动 run_check 不受窗口限制。"""
+        with self._lock:
+            mon = self._state["monitors"].get(name)
+        if mon is None:
+            return {"monitor": name, "skipped": True, "reason": "not found"}
+        if not mon.get("enabled", True):
+            return {"monitor": name, "skipped": True, "reason": "disabled"}
+        if not self._in_window(mon):
+            return {"monitor": name, "skipped": True, "reason": "outside schedule window"}
+        return self.run_check(name)
 
     def restore_schedules(self) -> None:
         """服务启动时恢复所有启用的监控。

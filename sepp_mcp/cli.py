@@ -1,9 +1,10 @@
-"""命令行入口：serve（默认）/ run-check（配合 cron）/ monitor-add（建监控）/ daemon（常驻）"""
+"""命令行入口：serve（默认）/ run-check（配合 cron）/ monitor-add（建监控）/ monitor-update（改监控）/ daemon（常驻）"""
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import sys
 
 
 def _setup_logging(level: str) -> None:
@@ -37,6 +38,13 @@ def main(argv: list[str] | None = None) -> None:
     add.add_argument("--timeout-hours", type=float, default=None, help="超时阈值（小时），默认取配置值")
     add.add_argument("--no-new-alert", action="store_true", help="不提醒新增缺陷")
     add.add_argument("--no-timeout-alert", action="store_true", help="不提醒超时未处理")
+
+    upd = sub.add_parser("monitor-update", help="更新监控配置（轮询间隔 / 每天时间窗口）")
+    upd.add_argument("--name", required=True, help="监控名称")
+    upd.add_argument("--interval-minutes", type=int, default=None, help="轮询间隔（分钟），如 5")
+    upd.add_argument("--schedule-start", default=None, help="每天开始轮询时间 HH:MM，如 09:00（不传则保持原值）")
+    upd.add_argument("--schedule-end", default=None, help="每天结束轮询时间 HH:MM，如 20:30（不传则保持原值）")
+    upd.add_argument("--clear-schedule", action="store_true", help="清除时间窗口（恢复全天轮询）")
 
     sub.add_parser("daemon", help="后台守护运行所有启用的监控（不启动 MCP，常驻进程）")
 
@@ -80,6 +88,39 @@ def main(argv: list[str] | None = None) -> None:
             timeout_hours=args.timeout_hours,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        if not monitor._owns_schedule:
+            print(
+                "\n警告：已有 serve/daemon 实例持有调度权，但它的定时调度不包含此新监控，"
+                "定时轮询不会自动启动。\n请重启该 serve（或运行 `python -m sepp_mcp daemon`）后才会开始；"
+                "若通过 agent 使用，请改用 MCP 工具 monitor_add（会立即生效）。",
+                file=sys.stderr,
+            )
+        return
+
+    if args.cmd == "monitor-update":
+        from .config import load_config
+        from .monitor import DefectMonitor
+
+        cfg = load_config()
+        monitor = DefectMonitor(cfg)
+        if args.clear_schedule:
+            start = end = ""
+        else:
+            start = args.schedule_start
+            end = args.schedule_end
+        result = monitor.update_monitor(
+            name=args.name,
+            interval_minutes=args.interval_minutes,
+            schedule_start=start,
+            schedule_end=end,
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if not monitor._owns_schedule:
+            print(
+                "\n警告：已有 serve/daemon 实例持有调度权，改动已写入 state，"
+                "但需要重启该实例才会按新配置调度。",
+                file=sys.stderr,
+            )
         return
 
     if args.cmd == "daemon":
